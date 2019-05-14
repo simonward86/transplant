@@ -94,6 +94,9 @@ class TransplantMaster:
 
     def _del_proxy(self, handle):
         """Tell the remote to forget about this proxy object."""
+        # ignore if remote already shut down:
+        if self.socket.closed:
+            return
         self.send_message('del_proxy', handle=handle)
 
     def __getattr__(self, name):
@@ -153,7 +156,7 @@ class TransplantMaster:
 
         self._wait_socket(zmq.POLLIN)
         if self.msgformat == 'msgpack':
-            response = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), encoding='utf-8')
+            response = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False, max_bin_len=2**31-1)
         else:
             response = self.socket.recv_json(flags=zmq.NOBLOCK)
 
@@ -277,7 +280,7 @@ class TransplantMaster:
         if isinstance(data, str):
             out = np.fromstring(base64.b64decode(data.encode()), dtype)
         else:
-            out = np.fromstring(data, dtype)
+            out = np.frombuffer(data, dtype)
         shape = [int(n) for n in shape]; # numpy requires integer indices
         return out.reshape(*shape)
 
@@ -317,7 +320,8 @@ class TransplantMaster:
         row, col, value = (self._decode_matrix(d).ravel()
                            if d is not None else []
                            for d in data[2:])
-        return scipy.sparse.coo_matrix((value, (row, col)), shape=data[1])
+        shape = (int(d) for d in data[1]) # convert shape to int
+        return scipy.sparse.coo_matrix((value, (row, col)), shape=shape)
 
     def _encode_proxy(self, data):
         """Encode a ProxyObject as a special list.
@@ -346,9 +350,15 @@ class TransplantMaster:
 
 
 class MatlabProxyObject:
-    """Forwards all property access to an associated Matlab object."""
+    """A Proxy for an object that exists in Matlab.
+
+    All property accesses and function calls are executed on the
+    Matlab object in Matlab.
+
+    """
 
     def __init__(self, process, handle):
+        """foo"""
         self.__dict__['handle'] = handle
         self.__dict__['process'] = process
 
@@ -356,6 +366,14 @@ class MatlabProxyObject:
         return self.process.fieldnames(self)
 
     def __getattr__(self, name):
+        """Retrieve a value or function from the object.
+
+        Properties are returned as native Python objects or
+        :class:`MatlabProxyObject` objects.
+
+        Functions are returned as :class:`MatlabFunction` objects.
+
+        """
         m = self.process
         # if it's a property, just retrieve it
         if name in m.properties(self, nargout=1):
@@ -397,40 +415,94 @@ class MatlabProxyObject:
 
 
 class MatlabStruct(dict):
-    "Mark a dict to be decoded as struct instead of containers.map"
+    "Mark a dict to be decoded as struct instead of containers.Map"
     pass
 
 
-class classproperty(property):
-    def __get__(self, cls, owner):
-        return classmethod(self.fget).__get__(None, owner)()
-
 class MatlabFunction:
+    """A Proxy for a Matlab function."""
     def __init__(self, parent, fun):
         self._parent = parent
         self._fun = fun
 
     def __call__(self, *args, nargout=-1, **kwargs):
+        """Call the Matlab function.
+
+        Calling this function will transfer all function arguments
+        from Python to Matlab, and translate them to the appropriate
+        Matlab data structures.
+
+        Return values are translated the same way, and transferred
+        back to Python.
+
+        Parameters
+        ----------
+        nargout : int
+            Call the function in Matlab with this many output
+            arguments. If not given, will execute ``nargout(func)`` in
+            Matlab to figure out the correct number of output
+            arguments. If this fails, execute ``ans = func(...)``, and
+            return the value of ``ans``.
+        **kwargs : dict
+            Keyword arguments are transparently translated to Matlab's
+            key-value pairs. For example, ``matlab.struct(foo="bar")``
+            will be translated to ``struct('foo', 'bar')``.
+
+        """
         # serialize keyword arguments:
         args += sum(kwargs.items(), ())
         return self._parent._call(self._fun, args, nargout=nargout)
-
-    # only fetch documentation when it is actually needed:
-    @classproperty
-    def __doc__(self):
-        return self._parent.help(self._fun, nargout=1)
 
 
 class Matlab(TransplantMaster):
     """An instance of Matlab, running in its own process.
 
-    if `address` is supplied, Matlab is started on a remote machine.
+    if ``address`` is supplied, Matlab is started on a remote machine.
     This is done by opening an SSH connection to that machine
-    (optionally using user account `user`), and then starting Matlab
+    (optionally using user account ``user``), and then starting Matlab
     on that machine. For this to work, `address` must be reachable
-    using SSH, `matlab` must be in the `user`'s PATH, and
-    `transplant_remote` must be in Matlab's `path` and `messenger`
-    must be available on both the local and the remote machine.
+    using SSH, ``matlab`` must be in the ``user``'s PATH, and
+    ``transplant_remote`` must be in Matlab's ``path`` and `libzmq`
+    must be available on the remote machine.
+
+    All Matlab errors are caught in Matlab, and re-raised as
+    :class:`TransplantError` in Python. Some Matlab errors can not be
+    caught with try-catch. In this case, Transplant will not be able
+    to get a backtrace, but will continue running (as part of
+    ``atexit`` in Matlab). If this happens often, performance might
+    degrade.
+
+    In case Matlab segfaults or otherwise terminates abnormally,
+    Transplant will raise a :class:`TransplantError`, and you will
+    need to create a new :class:`Matlab` instance.
+
+    ``SIGINT``/``KeyboardInterrupt`` will be forwarded to Matlab. Be
+    aware however, that some Matlab functions silently ignore
+    ``SIGINT``, and will continue running regardless.
+
+    Parameters
+    ----------
+    executable : str
+        The executable name, defaults to ``matlab``.
+    arguments : tuple
+        Additional arguments to supply to the executable, defaults to
+        ``-nodesktop``, ``-nosplash``, and on Windows, ``-minimize``.
+    msgformat : str
+        The communication format to use for talking to Matlab,
+        defaults to ``"msgpack"``. For debugging, you can use
+        ``"json"`` instead.
+    address : str
+        An address of a remote SSH-reachable machine on which to call
+        Matlab.
+    user : str
+        The user name to use for the SSH connection (if ``address`` is
+        given).
+    print_to_stdout : bool
+        Whether to print outputs to stdout, defaults to ``True``.
+    desktop : bool
+        Whether to start Matlab with ``-nodesktop``, defaults to ``True``.
+    jvm : bool
+        Whether to start Matlab with ``-nojvm``, defaults to ``False``.
 
     """
 
@@ -483,6 +555,8 @@ class Matlab(TransplantMaster):
             process_arguments = (['ssh', address, executable, '-wait'] + list(arguments) +
                                  ['-r', '"transplant_remote {} {} {}"'
                                       .format(msgformat, zmq_address, "zmq")])
+        if sys.platform == 'win32' or sys.platform == 'cygwin':
+            process_arguments += ['-wait']
         self.msgformat = msgformat
         # Create a new ZMQ context instead of sharing the global ZMQ context.
         # We now have ownership of it, and can terminate it with impunity.
@@ -513,7 +587,7 @@ class Matlab(TransplantMaster):
             self.process.send_signal(SIGINT)
             # receive outstanding message to get ZMQ back in the right state
             if self.msgformat == 'msgpack':
-                response = msgpack.unpackb(self.socket.recv(), encoding='utf-8')
+                response = msgpack.unpackb(self.socket.recv(), raw=False, max_bin_len=2**31-1)
             else:
                 response = self.socket.recv_json()
             # continue with the exception
@@ -525,11 +599,40 @@ class Matlab(TransplantMaster):
     def _decode_function(self, data):
         """Decode a special list to a wrapper function."""
 
-        return MatlabFunction(self, data[1])
+        # Wrap functions in a MatlabFunction class with a __doc__
+        # property.
+        # However, there are two ways of accessing documentation:
+        # - help(func) will access __doc__ on type(func), so __doc__
+        #   must be accessible on the class of the returned value.
+        # - func.__doc__ must also be accessible on the object itself.
+        #
+        # The following constructs a new class with the appropriate
+        # __doc__ property that is accessible both on the class and
+        # the object.
+
+        class classproperty(property):
+            def __get__(self, cls, owner):
+                return classmethod(self.fget).__get__(None, owner)()
+
+        class ThisFunc(MatlabFunction):
+            # only fetch documentation when it is actually needed:
+            @classproperty
+            def __doc__(_self):
+                return self.help(data[1], nargout=1)
+
+        return ThisFunc(self, data[1])
 
 
     def __getattr__(self, name):
-        """Retrieve a value or function from the remote."""
+        """Retrieve a value or function from the remote.
+
+        Global variables are returned as native Python objects or
+        :class:`MatlabProxyObject` objects.
+
+        Functions are returned as :class:`MatlabFunction` objects.
+
+        """
+
         try:
             return self._get_global(name)
         except TransplantError as err:
@@ -616,7 +719,7 @@ class Matlab(TransplantMaster):
         except:
             return []
 
-        search_dirs = re.compile('SEARCH_DIR\(([^)]*)\)').findall(output)
+        search_dirs = re.compile(r'SEARCH_DIR\(([^)]*)\)').findall(output)
         return [d.strip(' "') for d in search_dirs]
 
     def _read_ldsoconf(self, file):
